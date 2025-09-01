@@ -7,9 +7,9 @@ pub const TOTAL_BLOCK_SIZE: usize = ID_SIZE + BLOCK_DATA_SIZE + NEXT_BLOCK_OFFSE
 // Block structure for file storage
 #[derive(Debug, Clone)]
 pub struct Block {
-    id: u64,
-    data: [u8; BLOCK_DATA_SIZE],
-    next_block_offset: u64,
+    pub id: u64,
+    pub data: [u8; BLOCK_DATA_SIZE],
+    pub next_block_offset: u64,
 }
 
 impl Default for Block {
