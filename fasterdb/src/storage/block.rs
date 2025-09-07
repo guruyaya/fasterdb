@@ -1,4 +1,4 @@
-use crate::storage::serialization::ToBytes;
+use crate::storage::serialization::{FromBytes, SizeExtraction, ToBytes};
 pub const ID_SIZE:usize = 8;
 pub const BLOCK_DATA_SIZE:usize = 1008;
 pub const NEXT_BLOCK_OFFSET_SIZE:usize = 8;
@@ -95,6 +95,22 @@ impl ToBytes for Block {
     }
 }
 
+impl FromBytes for Block {
+    fn from_bytes_vec(bytes: &[u8]) -> Result<Self, super::serialization::FromBytesError> where Self:Sized {
+        if bytes[0..8].iter().all(|&b| b == 0) {
+            return Ok(Self::default());
+        }
+        
+        let id = u64::from_bytes_vec(&bytes[0..8])?;
+        let data_array: [u8; BLOCK_DATA_SIZE] = bytes[8..1016].try_into().map_err(|_| super::serialization::FromBytesError::ReadLenError)?;
+        let next_block_offset = u64::from_bytes_vec(&bytes[1016..1024])?;
+        Ok(Self { id: id, data: data_array, next_block_offset: next_block_offset })
+    }
+
+    fn get_size_strategy() -> SizeExtraction {
+        SizeExtraction::Constant(1024)
+    }
+}
 #[cfg(test)]
 mod test{
     use crate::storage::serialization::ToBytes;
