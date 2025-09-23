@@ -1,4 +1,4 @@
-use crate::storage::serialization::{FromBytes, SizeExtraction, ToBytes};
+use crate::storage::{block_stroage::BlockSeek, serialization::{FromBytes, SizeExtraction, ToBytes}};
 pub const ID_SIZE:usize = 8;
 pub const BLOCK_DATA_SIZE:usize = 1008;
 pub const NEXT_BLOCK_OFFSET_SIZE:usize = 8;
@@ -75,6 +75,13 @@ impl Block {
     
     pub fn get_next_block(&self) -> u64 {
         self.next_block_offset
+    }
+    pub fn get_next_offset(&self) -> Option<BlockSeek> {
+        let next_block = self.get_next_block();
+        match next_block {
+            0 => None,
+            _ => Some(BlockSeek::Current(next_block as i64))
+        }
     }
 
 }

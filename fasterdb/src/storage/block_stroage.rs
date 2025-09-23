@@ -1,6 +1,6 @@
 use std::{fs::File, io::{Read, Seek, SeekFrom, Write}, path::PathBuf, sync::{Arc, RwLock, RwLockWriteGuard}};
 
-use crate::storage::{block::{Block, TOTAL_BLOCK_SIZE}, serialization::{FromBytes, FromBytesError, ToBytes}};
+use crate::storage::{block::{Block, BLOCK_DATA_SIZE, TOTAL_BLOCK_SIZE}, serialization::{FromBytes, FromBytesError, ToBytes}};
 
 #[derive(Clone, Debug)]
 pub enum StorageOption {
@@ -12,6 +12,12 @@ impl<T: Write + Seek> WriteSeek for T {}
 
 pub trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
+
+#[derive(Clone)]
+pub enum BlockSeek{
+    Start(u64),
+    Current(i64),
+}
 
 pub struct Writer{
     stored_in: StorageOption,
@@ -29,7 +35,8 @@ pub enum WriterError {
 pub enum ReaderError {
     Io(std::io::Error),
     LockError(String), // משתמשים ב-String במקום PoisonError כדי להימנע מבעיות גנריות
-    FromBytesError(FromBytesError)
+    FromBytesError(FromBytesError),
+    FromReaderError(String)
 }
 
 impl From<std::io::Error> for WriterError{
@@ -50,6 +57,9 @@ impl From<FromBytesError> for ReaderError {
     }
 }
 
+type WriterGuard<'a> = RwLockWriteGuard<'a, Box<dyn WriteSeek>>;
+type ReaderGuard<'a> = RwLockWriteGuard<'a, Box<(dyn ReadSeek + 'static)>>;
+
 impl Writer{
     pub fn new(stored_in: StorageOption) -> Result<Self, WriterError> {
         Ok(Self{
@@ -64,26 +74,24 @@ impl Writer{
         })
     }
 
-    fn get_writer(&self) -> Result<RwLockWriteGuard<Box<(dyn WriteSeek + 'static)>>, WriterError> {
+    fn get_seek(&self, seek: BlockSeek) -> Option<SeekFrom>{
+        match seek {
+            BlockSeek::Current(pos) => Some(SeekFrom::Current((pos - 1) * TOTAL_BLOCK_SIZE as i64)),
+            BlockSeek::Start(pos) => Some(SeekFrom::Start(self.header_size + (pos * TOTAL_BLOCK_SIZE as u64))),
+        }
+    }
+
+    fn get_writer(&self) -> Result<WriterGuard, WriterError> {
         self.fd.write().map_err(|e| {
             WriterError::LockError(format!("Failed to acquire write lock {:?}", e))
         })
     }
 
-    pub fn write(&self, block: Block, position: u64) -> Result<usize, WriterError>{
-        let buf = block.to_bytes_vec();
-        let mut writer = self.get_writer()?;
-        
-        writer.seek(SeekFrom::Start(self.header_size + (position * TOTAL_BLOCK_SIZE as u64)))?; // 1024 is the size
-        let written_len = writer.write(&buf)?;
-        Ok(written_len)
-    }
-
-    pub fn write_seek(&self, block: Block, seek: i64) -> Result<usize, WriterError>{
+    pub fn write(&self, block: Block, seek: BlockSeek) -> Result<usize, WriterError>{
         let buf = block.to_bytes_vec();
         let mut writer = self.get_writer()?;
 
-        // writer.seek(SeekFrom::Current((seek - 1) * TOTAL_BLOCK_SIZE as i64))?; 
+        writer.seek(self.get_seek(seek).unwrap())?;
         let written_len = writer.write(&buf)?;
         Ok(written_len)
     }
@@ -117,23 +125,46 @@ impl Reader {
         })
     }
 
-    pub fn read_block(&self, position: u64) -> Result<Block, ReaderError>{
-        let mut reader = self.fd.write().map_err(|e| {
-            ReaderError::LockError(format!("Failed to acquire read lock for flush: {:?}", e))
-        })?;
-        let mut buf = [0u8;TOTAL_BLOCK_SIZE];
-        let seek_position = self.header_size + (position * TOTAL_BLOCK_SIZE as u64);
-        reader.seek(SeekFrom::Start(seek_position))?;
+    fn get_seek(&self, seek: BlockSeek) -> SeekFrom{
+        match seek {
+            BlockSeek::Current(pos) => SeekFrom::Current((pos - 1) * TOTAL_BLOCK_SIZE as i64),
+            BlockSeek::Start(pos) => SeekFrom::Start(self.header_size + (pos * TOTAL_BLOCK_SIZE as u64)),
+        }
+    }
 
+    fn get_reader(&self) -> Result<ReaderGuard, ReaderError> {
+        self.fd.write().map_err(|e| {
+            ReaderError::LockError(format!("Failed to acquire write lock {:?}", e))
+        })
+    }
+
+    pub fn read_block(&self, position: BlockSeek) -> Result<Block, ReaderError>{
+        let mut reader = self.get_reader()?;
+        let mut buf = [0u8;TOTAL_BLOCK_SIZE];
+
+        reader.seek(self.get_seek(position))?;
+        
         reader.read_exact(&mut buf)?;
         Ok(Block::from_bytes_vec(&buf)?)
+    }
+
+    pub fn read_full_item(&self, position: BlockSeek) -> Result<Vec<u8>, ReaderError>{
+        let mut out: Vec<u8> = vec![];
+        let mut search_pos = Some(position.clone());
+        while let Some(new_pos) = search_pos {
+            let block = self.read_block(new_pos.clone())?;
+            out.append(&mut block.get_data(BLOCK_DATA_SIZE, 0).map_err(|e| {
+                ReaderError::FromReaderError(e)
+            } )?);
+            search_pos = block.get_next_offset();
+        }
+        Ok(out)
 
     }
 }
+
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
-
     use super::*;
     use crate::storage::block::Block;
     use tempfile;
@@ -151,51 +182,47 @@ mod tests {
     }
 
     fn get_file_expected_data() -> Vec<u8> {
-        let mut out_vec = vec![0u8;2048];
-        out_vec[0] = 10;
-        out_vec[18] = 10;
-        out_vec[19] = 20;
-        out_vec[20] = 30;
-        out_vec[1016] = 1;
+        let mut out_vec = vec![0u8;2016];
+        out_vec[10] = 10;
+        out_vec[11] = 20;
+        out_vec[12] = 30;
 
-        out_vec[1024] = 10;
-        out_vec[1042] = 10;
-        out_vec[1043] = 20;
-        out_vec[1044] = 30;
+        out_vec[1034] = 10;
+        out_vec[1035] = 20;
+        out_vec[1036] = 30;
 
         out_vec
-
-
     }
+ 
     #[test]
     fn test_writer_and_reader() {
         let block = gen_block(true);
         
-        let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+        let tmpfile = tempfile::NamedTempFile::new().unwrap();
         let path = tmpfile.path().to_path_buf();
-        let writer_res = Writer::new(StorageOption::File(path));
+        let writer_res = Writer::new(StorageOption::File(path.clone()));
         assert!(writer_res.is_ok());
         
         let writer = writer_res.unwrap();
-        let result = writer.write(block, 0).unwrap();
+        let result = writer.write(block, BlockSeek::Start(0)).unwrap();
         assert_eq!(result, 1024);
         
         let block = gen_block(false);
-        let result = writer.write_seek(block, 1).unwrap(); // right to the next block
+        let result = writer.write(block, BlockSeek::Current(1)).unwrap(); // right to the next block
         assert_eq!(result, 1024);
 
         let flush_res = writer.flush();
         assert!(flush_res.is_ok());
 
-        tmpfile.seek(SeekFrom::Start(0)).unwrap();
+        // Now test the reader
 
-        let mut buffer = vec![0u8; 2048];
-        let read_res = tmpfile.read_exact(&mut buffer);
-        assert!(read_res.is_ok());
-        assert_eq!(buffer, get_file_expected_data());
-        assert_eq!(buffer, get_file_expected_data());
-    
-
+        let reader_res = Reader::new(StorageOption::File(path));
+        assert!(reader_res.is_ok());
+        let reader = reader_res.unwrap();
+        let data_res = reader.read_full_item(BlockSeek::Start(0));
+        assert!(data_res.is_ok());
+        let data = data_res.unwrap();
+        assert_eq!(data[0], get_file_expected_data()[0])
 
     }
 
